@@ -1,5 +1,5 @@
 [Unit]
-Description=Run RotDotRocks price snapshot every 6h
+Description=Run RotDotRocks price scraper every 6h
 
 [Timer]
 # Fires at 00:00, 06:00, 12:00, 18:00 UTC every day
@@ -8,7 +8,7 @@ OnCalendar=*-*-* 00,06,12,18:00:00
 RandomizedDelaySec=300
 # If the box was off when a fire-time passed, run on next boot
 Persistent=true
-Unit=rotrocks-snapshot.service
+Unit=rotrocks-scraper.service
 
 [Install]
 WantedBy=timers.target

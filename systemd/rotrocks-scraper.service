@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=ec2-user
-WorkingDirectory=/opt/rotrocks-scraper
-EnvironmentFile=/etc/rotrocks/snapshot.env
+WorkingDirectory=/opt/rotrocks/scraper
+EnvironmentFile=/etc/rotrocks/scraper.env
 ExecStart=/usr/bin/npm run snapshot
 TimeoutStartSec=2400
 # Exit code 2 is "scrape interrupted but partial results were applied" — treat
@@ -19,7 +19,7 @@ StandardError=journal
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/rotrocks-scraper /tmp
+ReadWritePaths=/opt/rotrocks/scraper /tmp
 ProtectHome=true
 PrivateTmp=true
 

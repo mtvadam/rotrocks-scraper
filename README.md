@@ -39,7 +39,17 @@ npm run snapshot            # takes 5-20 min; writes to whatever DB you configur
 
 ### 3. Deploy to EC2
 
-Tested on Amazon Linux 2023.
+Tested on Amazon Linux 2023. The layout assumes you'll host other rot.rocks services (discord bot, API, etc.) on the same box as siblings under `/opt/rotrocks/`.
+
+**Directory layout this repo assumes on EC2:**
+
+```
+/opt/rotrocks/scraper/              # this repo lives here
+/etc/rotrocks/scraper.env           # this service's secrets (mode 600, root)
+/etc/systemd/system/rotrocks-scraper.{service,timer}
+```
+
+(Future services follow the same pattern: `/opt/rotrocks/discord-bot/`, `/etc/rotrocks/discord-bot.env`, `rotrocks-discord-bot.service`.)
 
 ```bash
 ssh ec2-user@<your-ec2-public-ip>
@@ -50,57 +60,59 @@ sudo dnf install -y git make gcc-c++
 curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
 sudo dnf install -y nodejs
 
-# Clone the repo
-sudo mkdir -p /opt/rotrocks-scraper
-sudo chown ec2-user:ec2-user /opt/rotrocks-scraper
-cd /opt
-git clone https://github.com/<your-user>/rotrocks-scraper.git
-cd /opt/rotrocks-scraper
+# Create the parent dirs (one-time, shared across all rot.rocks services)
+sudo mkdir -p /opt/rotrocks /etc/rotrocks
+sudo chown ec2-user:ec2-user /opt/rotrocks
+
+# Clone this repo as the "scraper" service
+git clone https://github.com/<your-user>/rotrocks-scraper.git /opt/rotrocks/scraper
+cd /opt/rotrocks/scraper
 npm install
 
 # Set up the secrets file (root-owned, mode 600)
-sudo mkdir -p /etc/rotrocks
-sudo touch /etc/rotrocks/snapshot.env
-sudo chmod 600 /etc/rotrocks/snapshot.env
-sudo nano /etc/rotrocks/snapshot.env
-# paste your DATABASE_URL=... and NODE_ENV=production, save
+sudo tee /etc/rotrocks/scraper.env > /dev/null <<'EOF'
+DATABASE_URL=postgresql://...your-direct-supabase-url:5432/postgres
+NODE_ENV=production
+EOF
+sudo chmod 600 /etc/rotrocks/scraper.env
+sudo chown root:root /etc/rotrocks/scraper.env
 
 # Smoke test (live scrape — only do this if ready)
-set -a && source /etc/rotrocks/snapshot.env && set +a
+set -a && source /etc/rotrocks/scraper.env && set +a
 npm run snapshot
 
 # If happy, install the systemd unit + timer
-sudo cp systemd/rotrocks-snapshot.service /etc/systemd/system/
-sudo cp systemd/rotrocks-snapshot.timer /etc/systemd/system/
+sudo cp systemd/rotrocks-scraper.service /etc/systemd/system/
+sudo cp systemd/rotrocks-scraper.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now rotrocks-snapshot.timer
+sudo systemctl enable --now rotrocks-scraper.timer
 
-# Verify
-systemctl list-timers rotrocks-snapshot.timer
+# Verify the timer is loaded
+systemctl list-timers rotrocks-scraper.timer
 ```
 
-The timer fires at 00:00, 06:00, 12:00, 18:00 UTC every day. Adjust `OnCalendar` in `systemd/rotrocks-snapshot.timer` if you want a different schedule.
+The timer fires at 00:00, 06:00, 12:00, 18:00 UTC every day. Adjust `OnCalendar` in `systemd/rotrocks-scraper.timer` if you want a different schedule.
 
 ### 4. Day-to-day operations
 
 ```bash
 # Trigger a run right now
-sudo systemctl start rotrocks-snapshot.service
+sudo systemctl start rotrocks-scraper.service
 
 # Tail logs while running
-sudo journalctl -u rotrocks-snapshot.service -f
+sudo journalctl -u rotrocks-scraper.service -f
 
 # Last 200 log lines
-sudo journalctl -u rotrocks-snapshot.service -n 200 --no-pager
+sudo journalctl -u rotrocks-scraper.service -n 200 --no-pager
 
 # Pause the schedule
-sudo systemctl stop rotrocks-snapshot.timer
+sudo systemctl stop rotrocks-scraper.timer
 
 # Resume
-sudo systemctl start rotrocks-snapshot.timer
+sudo systemctl start rotrocks-scraper.timer
 
 # Pull a code update
-cd /opt/rotrocks-scraper && git pull && npm install
+cd /opt/rotrocks/scraper && git pull && npm install
 ```
 
 ## Keeping in sync with the main repo
@@ -117,7 +129,7 @@ git commit -m "Sync from main: <describe the fix>"
 git push
 # then on EC2
 ssh ec2-user@<your-ec2>
-cd /opt/rotrocks-scraper && git pull
+cd /opt/rotrocks/scraper && git pull
 ```
 
 **Never edit `src/lib/` files directly in this repo.** Make changes in the main RotDotRocks repo (where the admin UI also uses them), then sync. Divergence between the two repos = "works in admin but breaks in cron" pain.
