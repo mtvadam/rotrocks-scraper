@@ -1,0 +1,27 @@
+[Unit]
+Description=RotDotRocks price-snapshot scraper (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/opt/rotrocks-scraper
+EnvironmentFile=/etc/rotrocks/snapshot.env
+ExecStart=/usr/bin/npm run snapshot
+TimeoutStartSec=2400
+# Exit code 2 is "scrape interrupted but partial results were applied" — treat
+# as success so systemd doesn't mark the unit failed.
+SuccessExitStatus=0 2
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/rotrocks-scraper /tmp
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

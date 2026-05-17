@@ -1,0 +1,25 @@
+{
+  "name": "rotrocks-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone price-snapshot scraper for rot.rocks. Designed to run on EC2 (or any Node host) every 6 hours via systemd timer. Writes directly to the same Supabase Postgres the web app reads.",
+  "type": "commonjs",
+  "scripts": {
+    "snapshot": "tsx src/cron-snapshot.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@paralleldrive/cuid2": "^3.3.0",
+    "dotenv": "^16.4.7",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/pg": "^8.20.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

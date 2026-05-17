@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.next/
+.env
+.env.local
+.env.production
+.env.development
+*.log
+.DS_Store
+.tsbuildinfo
+*.tsbuildinfo
+/tmp/
+.idea/
+.vscode/
