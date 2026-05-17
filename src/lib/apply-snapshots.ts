@@ -432,30 +432,30 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
     )
   }
 
-  // Step 2: for snapshots that actually got a BMV write, record the applied
-  // robux value (chart reads this back) and the isProjected flag.
-  const updatesByVariant = new Map<string, { value: number; isProjected: boolean; projectedReason: string | null; ids: string[] }>()
+  // Step 2: record appliedRobuxValue + isProjected per snapshot in bulk (VALUES join).
+  // The old per-variant loop issued one UPDATE per unique projectedReason string —
+  // often 200+ round-trips that exhaust Supabase's 15-session pooler limit.
+  const detailRows: Array<{ id: string; value: number; isProjected: boolean; projectedReason: string | null }> = []
   for (const s of snapsToMark) {
     if (!appliedBrainrotIds.has(s.brainrotId)) continue
     const entry = appliedByKey.get(`${s.brainrotId}:${s.mutationId}`)
     if (!entry) continue
-    const key = `${entry.value}|${entry.isProjected ? 1 : 0}|${entry.projectedReason ?? ''}`
-    const slot = updatesByVariant.get(key) || { value: entry.value, isProjected: entry.isProjected, projectedReason: entry.projectedReason, ids: [] }
-    slot.ids.push(s.id)
-    updatesByVariant.set(key, slot)
+    detailRows.push({
+      id: s.id,
+      value: entry.value,
+      isProjected: entry.isProjected,
+      projectedReason: entry.projectedReason,
+    })
   }
 
-  for (const slot of updatesByVariant.values()) {
-    if (slot.ids.length === 0) continue
-    await execute(
-      `UPDATE "PriceSnapshot"
-       SET "appliedRobuxValue" = $1, "isProjected" = $2, "projectedReason" = $3
-       WHERE "id" = ANY($4::text[])`,
-      [slot.value, slot.isProjected, slot.projectedReason, slot.ids]
-    )
+  if (detailRows.length > 0) {
+    console.log(`[apply] bulk marking ${detailRows.length} snapshots with appliedRobuxValue…`)
+    const t1 = Date.now()
+    await bulkMarkSnapshotAppliedValues(detailRows)
+    console.log(`[apply] bulk mark done in ${((Date.now() - t1) / 1000).toFixed(1)}s`)
   }
-  const totalUpdated = [...updatesByVariant.values()].reduce((s, x) => s + x.ids.length, 0)
-  const projectedCount = [...updatesByVariant.values()].filter(x => x.isProjected).reduce((s, x) => s + x.ids.length, 0)
+  const totalUpdated = detailRows.length
+  const projectedCount = detailRows.filter(r => r.isProjected).length
   console.log(`[apply] marked ${allAppliedIds.length} snapshots applied; ${totalUpdated} with appliedRobuxValue recorded (${projectedCount} flagged projected)`)
 
   const allApplied = !verifiedBrainrotIds || verifiedBrainrotIds.length === 0 || verifiedBrainrotIds.length >= preview.brainrots.length
@@ -467,5 +467,32 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
     totalSnapshots: preview.totalSnapshots,
     appliedSnapshotIds: allAppliedIds.length,
     volatileCount,
+  }
+}
+
+/** Bulk-update appliedRobuxValue / isProjected / projectedReason in chunked VALUES joins. */
+async function bulkMarkSnapshotAppliedValues(
+  rows: Array<{ id: string; value: number; isProjected: boolean; projectedReason: string | null }>
+) {
+  const CHUNK = 200
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const slice = rows.slice(i, i + CHUNK)
+    const values: unknown[] = []
+    const tuples: string[] = []
+    for (let j = 0; j < slice.length; j++) {
+      const r = slice[j]
+      const b = j * 4 + 1
+      tuples.push(`($${b}::text, $${b + 1}::int, $${b + 2}::boolean, $${b + 3}::text)`)
+      values.push(r.id, r.value, r.isProjected, r.projectedReason)
+    }
+    await execute(
+      `UPDATE "PriceSnapshot" AS ps
+       SET "appliedRobuxValue" = v.robux,
+           "isProjected" = v.proj,
+           "projectedReason" = v.reason
+       FROM (VALUES ${tuples.join(', ')}) AS v(id, robux, proj, reason)
+       WHERE ps."id" = v.id`,
+      values
+    )
   }
 }
