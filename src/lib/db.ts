@@ -36,10 +36,14 @@ function resolveConnectionString(): string {
 function buildPool(): pg.Pool {
   const p = new PoolCtor({
     connectionString: resolveConnectionString(),
-    // Single-process cron — keep the pool tiny.
-    max: 5,
+    // Single-process cron + Supabase free-tier session pooler (max 15 clients
+    // per project) — keep to 1 connection. All queries serialize through it.
+    // Since the apply phase's tail-end UPDATE loop is already sequential and
+    // bulk-write chunks are sequential too, this has no meaningful perf cost
+    // and guarantees we never trip EMAXCONNSESSION.
+    max: 1,
     idleTimeoutMillis: 8_000,
-    connectionTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 30_000,
     keepAlive: true,
     keepAliveInitialDelayMillis: 5_000,
   })
@@ -85,16 +89,45 @@ function isTransientConnError(err: unknown): boolean {
   )
 }
 
+// Supabase session pooler caps at 15 clients per project on the free tier.
+// When zombie sessions from prior failed runs are still being reaped, our
+// connection attempts get rejected with this XX000 error. Backoff + retry
+// works because the pooler releases sessions on its own ~10-30s later.
+function isPoolSaturatedError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false
+  const e = err as { message?: string; code?: string }
+  const msg = e.message?.toLowerCase() ?? ''
+  return (
+    msg.includes('max clients reached') ||
+    msg.includes('emaxconnsession') ||
+    msg.includes('too many connections')
+  )
+}
+
 async function poolQueryWithRetry(text: string, params?: unknown[]): Promise<pg.QueryResult> {
   const p = getPool()
-  try {
-    return await p.query(text, params)
-  } catch (err) {
-    if (isTransientConnError(err)) {
+  // 5 attempts with exponential backoff: 0s, 2s, 6s, 14s, 30s for pool saturation.
+  // Transient conn errors get 1 fast retry (same as before).
+  const maxAttempts = 5
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
       return await p.query(text, params)
+    } catch (err) {
+      lastErr = err
+      if (attempt < maxAttempts && isPoolSaturatedError(err)) {
+        const delayMs = Math.min(30_000, 2_000 * Math.pow(2, attempt - 1))
+        console.warn(`[pg.Pool] pool saturated (attempt ${attempt}/${maxAttempts}), backing off ${delayMs}ms`)
+        await new Promise(r => setTimeout(r, delayMs))
+        continue
+      }
+      if (attempt === 1 && isTransientConnError(err)) {
+        continue
+      }
+      throw err
     }
-    throw err
   }
+  throw lastErr
 }
 
 /** Run a single query through the shared pool */
