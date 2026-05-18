@@ -1,4 +1,4 @@
-import { query, execute } from '@/lib/db'
+import { query, queryOne, execute } from '@/lib/db'
 import { createId } from '@paralleldrive/cuid2'
 import { interpolateFloorValues } from '@/lib/value-interpolation'
 import { isVolatileJump } from '@/lib/value-state'
