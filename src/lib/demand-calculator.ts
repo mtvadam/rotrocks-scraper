@@ -144,25 +144,20 @@ export async function calculateAllDemand(): Promise<{ updated: number; skipped: 
 }
 
 /**
- * Deduplicate snapshots by day — average multiple snapshots from the same day.
+ * Deduplicate snapshots by day — keep the latest snapshot from each calendar day.
  */
 function deduplicateByDay(data: { value: number; date: Date }[]): { value: number; date: Date }[] {
-  const dayMap = new Map<string, { sum: number; count: number; date: Date }>()
+  const dayMap = new Map<string, { value: number; date: Date }>()
 
   for (const d of data) {
     const dayKey = d.date.toISOString().split('T')[0]
     const existing = dayMap.get(dayKey)
-    if (existing) {
-      existing.sum += d.value
-      existing.count++
-    } else {
-      dayMap.set(dayKey, { sum: d.value, count: 1, date: d.date })
+    if (!existing || d.date.getTime() > existing.date.getTime()) {
+      dayMap.set(dayKey, { value: d.value, date: d.date })
     }
   }
 
-  return Array.from(dayMap.values())
-    .map(d => ({ value: Math.round(d.sum / d.count), date: d.date }))
-    .sort((a, b) => a.date.getTime() - b.date.getTime())
+  return Array.from(dayMap.values()).sort((a, b) => a.date.getTime() - b.date.getTime())
 }
 
 /**

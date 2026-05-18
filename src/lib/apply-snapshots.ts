@@ -8,10 +8,8 @@ import { bulkInsert } from '@/lib/bulk-write'
  * Build a preview of how a batch of PriceSnapshot rows would translate into
  * updates to BrainrotMutationValue.
  *
- * NOTE on averaging: when multiple snapshots exist for the same (brainrot,
- * mutation), this function averages them. The cron-snapshot runner intentionally
- * passes only the IDs from a single run, so the average reduces to "just this
- * run's value" — i.e. "latest snapshot wins" with no cross-run averaging.
+ * When multiple snapshots exist for the same (brainrot, mutation), the
+ * newest row by createdAt wins — never averaged.
  */
 export async function buildPreview(snapshotIds: string[]) {
   // Fetch all active mutations
@@ -86,23 +84,23 @@ export async function buildPreview(snapshotIds: string[]) {
   for (const [brainrotId, brainrotSnapshots] of byBrainrot) {
     const first = brainrotSnapshots[0]
 
-    // Average multiple snapshots for same mutation. When the caller passes
-    // only one run's IDs (the cron case) this collapses to a single value.
-    const snapshotByMutation = new Map<string, { sum: number; count: number; outlierCount: number; listingCount: number }>()
+    // Latest snapshot wins per mutation (never averaged).
+    const snapshotByMutation = new Map<string, {
+      robuxPrice: number
+      isOutlier: boolean
+      listingCount: number
+      createdAt: Date
+    }>()
     for (const s of brainrotSnapshots) {
       if (s.robuxPrice === null) continue
+      const ts = new Date(s.createdAt).getTime()
       const existing = snapshotByMutation.get(s.mutationId)
-      if (existing) {
-        existing.sum += s.robuxPrice
-        existing.count++
-        existing.listingCount += s.listingCount ?? 0
-        if (s.isOutlier) existing.outlierCount++
-      } else {
+      if (!existing || ts > existing.createdAt.getTime()) {
         snapshotByMutation.set(s.mutationId, {
-          sum: s.robuxPrice,
-          count: 1,
-          outlierCount: s.isOutlier ? 1 : 0,
+          robuxPrice: s.robuxPrice,
+          isOutlier: s.isOutlier,
           listingCount: s.listingCount ?? 0,
+          createdAt: s.createdAt,
         })
       }
     }
@@ -112,10 +110,9 @@ export async function buildPreview(snapshotIds: string[]) {
     // are never modified by interpolation — this is the only place interpolation is used.
     const interpEntries: { mutationId: string; mutationName: string; multiplier: number; robuxValue: number }[] = []
     for (const [mutId, data] of snapshotByMutation) {
-      const avg = Math.round(data.sum / data.count)
-      if (avg > 0) {
+      if (data.robuxPrice > 0) {
         const mut = allMutations.find(m => m.id === mutId)
-        if (mut) interpEntries.push({ mutationId: mutId, mutationName: mut.name, multiplier: mut.multiplier, robuxValue: avg })
+        if (mut) interpEntries.push({ mutationId: mutId, mutationName: mut.name, multiplier: mut.multiplier, robuxValue: data.robuxPrice })
       }
     }
 
@@ -132,8 +129,8 @@ export async function buildPreview(snapshotIds: string[]) {
     const mutations = allMutations.map(mut => {
       const snapData = snapshotByMutation.get(mut.id)
       const currentStored = currentValueMap.get(`${brainrotId}:${mut.id}`) ?? null
-      const rawValue = snapData ? Math.round(snapData.sum / snapData.count) : null
-      const isOutlier = snapData ? snapData.outlierCount === snapData.count : false
+      const rawValue = snapData ? snapData.robuxPrice : null
+      const isOutlier = snapData ? snapData.isOutlier : false
       const hasNewData = rawValue !== null && rawValue > 0
       const interpolatedValue = interpMap.get(mut.id) ?? null
       const finalValue = interpolatedValue ?? rawValue ?? currentStored
@@ -458,6 +455,13 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
   const projectedCount = detailRows.filter(r => r.isProjected).length
   console.log(`[apply] marked ${allAppliedIds.length} snapshots applied; ${totalUpdated} with appliedRobuxValue recorded (${projectedCount} flagged projected)`)
 
+  // Same UTC day may have multiple imports (e.g. EC2 cron + manual). Only this batch
+  // should feed demand — older same-day rows are deactivated so charts/demand use latest.
+  const deactivated = await deactivateOlderSameDaySnapshots(snapshotIds)
+  if (deactivated > 0) {
+    console.log(`[apply] deactivated ${deactivated} older same-day snapshots from demand`)
+  }
+
   const allApplied = !verifiedBrainrotIds || verifiedBrainrotIds.length === 0 || verifiedBrainrotIds.length >= preview.brainrots.length
 
   return {
@@ -468,6 +472,27 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
     appliedSnapshotIds: allAppliedIds.length,
     volatileCount,
   }
+}
+
+/** Turn off usedForDemand on other imports from the same UTC day as this batch. */
+async function deactivateOlderSameDaySnapshots(snapshotIds: string[]): Promise<number> {
+  if (snapshotIds.length === 0) return 0
+
+  const dayRow = await queryOne<{ day: string }>(
+    `SELECT to_char(MAX("createdAt" AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day
+     FROM "PriceSnapshot" WHERE "id" = ANY($1::text[])`,
+    [snapshotIds]
+  )
+  if (!dayRow?.day) return 0
+
+  return execute(
+    `UPDATE "PriceSnapshot"
+     SET "usedForDemand" = false
+     WHERE "usedForDemand" = true
+       AND NOT ("id" = ANY($1::text[]))
+       AND to_char("createdAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD') = $2`,
+    [snapshotIds, dayRow.day]
+  )
 }
 
 /** Bulk-update appliedRobuxValue / isProjected / projectedReason in chunked VALUES joins. */
