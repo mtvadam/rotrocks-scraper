@@ -204,7 +204,9 @@ export async function buildPreview(snapshotIds: string[]) {
 
     const hasSuspicious = mutations.some(v => v.suspicious)
 
-    // Compute isProjected: low-confidence flag for the price chart UI.
+    // isProjected is shown on the public price-history chart only. Keep sparse-listing
+    // and large-move-vs-prior flags. Do NOT copy admin suspicious heuristics (inversions,
+    // expected-from-neighbors) or floor interpolation — those stay on the review UI only.
     for (const m of mutations) {
       if (!m.hasNewData) continue
       const reasons: string[] = []
@@ -215,10 +217,6 @@ export async function buildPreview(snapshotIds: string[]) {
         const ratio = m.finalValue / m.currentValue
         if (ratio >= 2) reasons.push(`${ratio.toFixed(1)}x jump from R$${m.currentValue.toLocaleString()}`)
         else if (ratio <= 0.5) reasons.push(`${(1 / ratio).toFixed(1)}x drop from R$${m.currentValue.toLocaleString()}`)
-      }
-      if (m.suspicious && m.suspiciousReason) reasons.push(m.suspiciousReason)
-      if (m.interpolatedValue !== null && m.rawValue !== m.interpolatedValue) {
-        reasons.push('floor-interpolated from neighbors')
       }
       if (reasons.length > 0) {
         m.isProjected = true
