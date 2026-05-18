@@ -204,15 +204,12 @@ export async function buildPreview(snapshotIds: string[]) {
 
     const hasSuspicious = mutations.some(v => v.suspicious)
 
-    // isProjected is shown on the public price-history chart only. Keep sparse-listing
-    // and large-move-vs-prior flags. Do NOT copy admin suspicious heuristics (inversions,
-    // expected-from-neighbors) or floor interpolation — those stay on the review UI only.
+    // isProjected is shown on the public price-history chart only for major moves vs
+    // the prior stored value (2x+ up or 50%+ down). Do NOT flag sparse listings,
+    // admin suspicious heuristics, or floor interpolation.
     for (const m of mutations) {
       if (!m.hasNewData) continue
       const reasons: string[] = []
-      if (m.listingCount > 0 && m.listingCount < 5) {
-        reasons.push(`only ${m.listingCount} listing${m.listingCount === 1 ? '' : 's'}`)
-      }
       if (m.currentValue && m.finalValue && m.currentValue > 0) {
         const ratio = m.finalValue / m.currentValue
         if (ratio >= 2) reasons.push(`${ratio.toFixed(1)}x jump from R$${m.currentValue.toLocaleString()}`)
