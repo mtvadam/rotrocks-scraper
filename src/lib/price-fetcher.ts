@@ -99,7 +99,7 @@ function getMinListings(rarity: string, mutationName: string): number {
 
 const STOP_WORDS = new Set(['and', 'the', 'of', 'a', 'an', 'in', 'on', 'my', 'no'])
 
-function titleMatchesBrainrot(title: string, brainrotName: string): boolean {
+export function titleMatchesBrainrot(title: string, brainrotName: string): boolean {
   const titleLower = title.toLowerCase()
   const titleWords = titleLower.replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean)
   // Dedupe name words so "Love Love Bear" requires both "love" and "bear" (not "love" twice).
@@ -180,7 +180,7 @@ const FRAUD_TITLE_PATTERNS = [
   /\bfull\s*set\b/i,
 ]
 
-function isFraudTitle(title: string): boolean {
+export function isFraudTitle(title: string): boolean {
   return FRAUD_TITLE_PATTERNS.some(p => p.test(title))
 }
 
@@ -204,7 +204,7 @@ const RULE_E_MIN_PRICES = 3
 const RULE_E_TRUST_OVERRIDE_RC = 50
 const RULE_E_TRUST_OVERRIDE_FB = 99
 
-interface PriceWithSeller { price: number; rc: number; fb: number; sellerId: string }
+export interface PriceWithSeller { price: number; rc: number; fb: number; sellerId: string }
 
 function dropUnsupportedLowestPrices(sortedAsc: PriceWithSeller[]): PriceWithSeller[] {
   if (sortedAsc.length < RULE_E_MIN_PRICES) return sortedAsc
@@ -244,7 +244,7 @@ function dedupBySeller(trusted: PriceWithSeller[]): PriceWithSeller[] {
 // `candidatesAsc` is the post-filter sorted price ladder, returned so the
 // monotonic-constraint pass at the end of the run can walk past inversions
 // (e.g. Diamond < Gold) without re-fetching from Eldorado.
-function pickFloorPrice(trusted: PriceWithSeller[]): { price: number | null; count: number; candidatesAsc: number[] } {
+export function pickFloorPrice(trusted: PriceWithSeller[]): { price: number | null; count: number; candidatesAsc: number[] } {
   if (trusted.length === 0) return { price: null, count: 0, candidatesAsc: [] }
   const deduped = dedupBySeller(trusted)
   const sorted = [...deduped].sort((a, b) => a.price - b.price)
@@ -278,7 +278,7 @@ async function onceAndRetry<T>(fn: () => Promise<T>, label: string): Promise<T> 
   }
 }
 
-const FETCH_HEADERS = {
+export const FETCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
   'Accept': 'application/json',
   'Accept-Language': 'en-US,en;q=0.9',

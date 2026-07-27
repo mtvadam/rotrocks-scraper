@@ -22,6 +22,7 @@
 import 'dotenv/config'
 import { createId } from '@paralleldrive/cuid2'
 import { fetchAllBrainrotPrices, type PriceResult } from '@/lib/price-fetcher'
+import { fetchAllCollectiblePrices, applyCollectiblePrices } from '@/lib/collectible-price-fetcher'
 import { bulkInsert } from '@/lib/bulk-write'
 import { applySnapshots } from '@/lib/apply-snapshots'
 import { calculateAllDemand } from '@/lib/demand-calculator'
@@ -169,6 +170,23 @@ async function main() {
     const demandResult = await calculateAllDemand()
     log('demand calculation done', { updated: demandResult.updated, skipped: demandResult.skipped })
 
+    // 5b. Scrape + apply collectible (Gear/BaseSkin) prices. Non-fatal: these are
+    //     supplementary catalogs and a failure shouldn't take down the brainrot run.
+    let collectiblesUpdated = 0
+    try {
+      log('scraping collectible prices (gears + base skins)...')
+      const collectibleResults = await fetchAllCollectiblePrices()
+      const applied = await applyCollectiblePrices(collectibleResults)
+      collectiblesUpdated = applied.updated
+      log('collectibles done', {
+        updated: applied.updated,
+        skipped: applied.skipped,
+        errors: collectibleResults.filter(r => r.error).length,
+      })
+    } catch (err) {
+      errLog('collectible scrape failed (non-fatal)', err)
+    }
+
     // 6. Write the run log to SystemConfig (the admin UI reads this).
     const logData = {
       totalFetched: results.length,
@@ -181,6 +199,7 @@ async function main() {
       outliers: results.filter(r => r.isOutlier).length,
       errors: results.filter(r => r.error).length,
       volatileCount: applyResult?.volatileCount ?? 0,
+      collectiblesUpdated,
       fetchedAt: new Date().toISOString(),
       triggeredManually: false,
       source: 'cron-ec2',
