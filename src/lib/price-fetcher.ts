@@ -195,16 +195,23 @@ function mutationToSlug(name: string): string {
 // big gap up to the rest. Disabled for markets with <3 listings (too little signal).
 // Repeats until the current lowest has a companion, which handles cascading outliers.
 //
-// NO reputation override, deliberately. There used to be one (rc >= 50 + fb >= 99%
-// skipped the drop) on the theory that only new-account undercutters post fake
-// floors — then scam accounts with farmed ratings (fb=100, rc=100) started
-// posting bait listings and sailed straight through it (observed: an $8
-// "Rebirth Cannelloni Dragoni" listing set Dragon Cannelloni's floor while the
-// real market walked at $15.29+). Reputation can be bought; a companion price
-// can't. The lowest price must ALWAYS have a walk of similar prices above it.
+// The reputation override history matters here: the original one (rc >= 50 +
+// fb >= 99%) assumed only new-account undercutters post fake floors — then scam
+// accounts with farmed ratings (fb=100, rc=100) sailed straight through it (an
+// $8 "Rebirth Cannelloni Dragoni" listing set Dragon Cannelloni's floor while
+// the real market walked at $15.29+), so it was removed entirely. That in turn
+// over-pruned the rarest brainrots: their trusted ladders are naturally sparse
+// with wide percentage gaps, and Rule E walked past REAL floors (Headless
+// Horseman's $3,000 listing from an rc=1259 shop was dropped for lacking a
+// companion within 1.25×, overshooting the floor to $8,800). Hence the current
+// bar: only a VERY established seller (rc >= 1000, fb >= 99%) can hold a lone
+// floor — an order of magnitude beyond observed rating-farms. Everyone else
+// still needs a walk of similar prices above them.
 const RULE_E_COMPANION_RATIO = 1.25
 const RULE_E_FP_EPSILON = 1.01
 const RULE_E_MIN_PRICES = 3
+const RULE_E_TRUST_OVERRIDE_RC = 1000
+const RULE_E_TRUST_OVERRIDE_FB = 99
 
 export interface PriceWithSeller { price: number; rc: number; fb: number; sellerId: string }
 
@@ -212,6 +219,7 @@ function dropUnsupportedLowestPrices(sortedAsc: PriceWithSeller[]): PriceWithSel
   if (sortedAsc.length < RULE_E_MIN_PRICES) return sortedAsc
   let arr = sortedAsc
   while (arr.length >= 2 && arr[1].price > arr[0].price * RULE_E_COMPANION_RATIO * RULE_E_FP_EPSILON) {
+    if (arr[0].rc >= RULE_E_TRUST_OVERRIDE_RC && arr[0].fb >= RULE_E_TRUST_OVERRIDE_FB) break
     arr = arr.slice(1)
     if (arr.length < RULE_E_MIN_PRICES) break
   }
@@ -388,8 +396,14 @@ async function fetchOffersViaSearchAllPages(
 // listings, low-rep sellers and fraud titles, and the trusted Default
 // listings don't surface until page 2-4. Paginate until we have enough
 // trusted matches (or hit the page cap).
-const DEFAULT_MAX_PAGES = 6
-const MUTATION_MAX_PAGES = 1
+// Caps are worst-case bounds, not typical cost: pagination short-circuits as
+// soon as minListings trusted offers are found and stops at totalPages, so
+// extra pages are only fetched when a bulk-listing flood is burying the real
+// market (observed: Headless Horseman's 5 trusted qty=1 listings sat on pages
+// 7-8 behind ~150 qty=10 flood listings — a 6-page cap returned nothing and
+// left the stale value frozen forever).
+const DEFAULT_MAX_PAGES = 12
+const MUTATION_MAX_PAGES = 3
 
 // Fetch offers for a specific brainrot + mutation combo (Mode A — te_v2).
 // For Default, paginates up to DEFAULT_MAX_PAGES and short-circuits as soon

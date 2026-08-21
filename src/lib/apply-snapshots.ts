@@ -4,12 +4,18 @@ import { interpolateFloorValues } from '@/lib/value-interpolation'
 import { isVolatileJump } from '@/lib/value-state'
 import { bulkInsert } from '@/lib/bulk-write'
 
-// Projected-flag thresholds, measured against the stored anchor (referenceValue).
+// Projected-flag thresholds, measured against the anchor: the 30-day average
+// of clean (non-projected) applied snapshots, computed fresh each run. An
+// average can't ratchet along with bad data the way previousValue did, and it
+// needs no stored state or manual upkeep — flagged applies are excluded, so a
+// staircase of suspect values never drags the baseline down with it.
 // Reason strings must keep the "N.Nx jump|drop from R$…" shape — that's what
 // projectedMetaForPriceChart whitelists for the public chart.
 const PROJECT_JUMP_RATIO = 1.5   // ≥1.5x above anchor → projected
 const PROJECT_DROP_RATIO = 1 / 1.5 // ≤0.67x of anchor (33%+ drop) → projected
-// Band inside which the anchor simply follows the new price (normal fluctuation).
+const ANCHOR_AVG_DAYS = 30
+// Band used by the acceptance pass to judge whether recent applies sit at the
+// new level (normal fluctuation range).
 const ANCHOR_FOLLOW_HI = 1.25
 const ANCHOR_FOLLOW_LO = 0.8
 // Cheap items have coarse price ticks (R$25 → R$50 is one step = "2x"), so ratio
@@ -20,11 +26,13 @@ const PROJECT_MIN_DELTA_ROBUX = 1000
 // 3x+ swing is projected pricing, not a coarse tick (observed: Los Cucarachas
 // R$25 → R$95 wore no flag). Extreme ratios bypass the delta gate.
 const PROJECT_EXTREME_RATIO = 3
-// Acceptance: a deviated level becomes the new anchor (and un-flags) once it has
-// held for STABLE_ACCEPT_WINDOW recent applied snapshots with at most
+// Acceptance: a flagged level stops being flagged once it has held for
+// STABLE_ACCEPT_WINDOW recent applied snapshots with at most
 // STABLE_ACCEPT_OUTLIERS wobbles outside the follow band — i.e. a genuine market
 // repricing stops being "projected" after ~3 days at 4 scrapes/day, while a
-// still-sliding staircase (values keep changing) never qualifies.
+// still-sliding staircase (values keep changing) never qualifies. Once applies
+// stop being flagged they enter the 30-day average, which then converges on the
+// new level on its own.
 const STABLE_ACCEPT_WINDOW = 12
 const STABLE_ACCEPT_OUTLIERS = 2
 const STABLE_ACCEPT_LOOKBACK_DAYS = 14
@@ -79,24 +87,48 @@ export async function buildPreview(snapshotIds: string[]) {
   // Get unique brainrot IDs from snapshots
   const brainrotIds = [...new Set(snapshots.map(s => s.brainrotId))]
 
-  // Fetch current stored values + anchors for all these brainrots
-  let currentValues: Array<{ brainrotId: string; mutationId: string; robuxValue: number; referenceValue: number | null }> = []
+  // Fetch current stored values for all these brainrots
+  let currentValues: Array<{ brainrotId: string; mutationId: string; robuxValue: number }> = []
   if (brainrotIds.length > 0) {
     const bPlaceholders = brainrotIds.map((_, i) => `$${i + 1}`).join(', ')
     currentValues = await query(
-      `SELECT "brainrotId", "mutationId", "robuxValue", "referenceValue"
+      `SELECT "brainrotId", "mutationId", "robuxValue"
        FROM "BrainrotMutationValue"
        WHERE "brainrotId" IN (${bPlaceholders})`,
       brainrotIds
     )
   }
 
+  // Anchor per pair: 30-day average of clean applied snapshots (flagged applies
+  // excluded so bad data can't drag the baseline). Current batch isn't applied
+  // yet, so it never pollutes its own anchor. Pairs with no clean history fall
+  // back to the stored value below.
+  let anchorRows: Array<{ brainrotId: string; mutationId: string; avgValue: number }> = []
+  if (brainrotIds.length > 0) {
+    const bPlaceholders = brainrotIds.map((_, i) => `$${i + 1}`).join(', ')
+    anchorRows = await query(
+      `SELECT "brainrotId", "mutationId", AVG("appliedRobuxValue")::float8 AS "avgValue"
+       FROM "PriceSnapshot"
+       WHERE "brainrotId" IN (${bPlaceholders})
+         AND "appliedToValues" = true
+         AND "isProjected" = false
+         AND "appliedRobuxValue" IS NOT NULL
+         AND "createdAt" >= NOW() - INTERVAL '${ANCHOR_AVG_DAYS} days'
+       GROUP BY "brainrotId", "mutationId"`,
+      brainrotIds
+    )
+  }
+
   const currentValueMap = new Map<string, number>()
   const anchorValueMap = new Map<string, number>()
+  for (const a of anchorRows) {
+    const avg = Math.round(a.avgValue)
+    if (avg > 0) anchorValueMap.set(`${a.brainrotId}:${a.mutationId}`, avg)
+  }
   for (const v of currentValues) {
     currentValueMap.set(`${v.brainrotId}:${v.mutationId}`, v.robuxValue)
-    const anchor = v.referenceValue ?? v.robuxValue
-    if (anchor > 0) anchorValueMap.set(`${v.brainrotId}:${v.mutationId}`, anchor)
+    const key = `${v.brainrotId}:${v.mutationId}`
+    if (!anchorValueMap.has(key) && v.robuxValue > 0) anchorValueMap.set(key, v.robuxValue)
   }
 
   // Group snapshots by brainrot
@@ -179,14 +211,9 @@ export async function buildPreview(snapshotIds: string[]) {
         suspiciousReason: null as string | null,
         isProjected: false as boolean,
         projectedReason: null as string | null,
-        // Anchor semantics: when a new value deviates from the stored anchor
-        // (referenceValue) the anchor is FROZEN — it must not ratchet along with
-        // suspect values, or a gradual staircase decline never re-triggers the
-        // projected flag (observed: SE Cyber slid R$229,900 → R$21,230 with one
-        // flag total). The apply step keeps the old anchor when freezeAnchor is
-        // set and adopts the new value otherwise.
+        // Anchor: 30-day clean-apply average (see buildPreview above). Computed
+        // fresh each run — no stored state, nothing to ratchet, nothing manual.
         anchorValue: anchorValueMap.get(`${brainrotId}:${mut.id}`) ?? null,
-        freezeAnchor: false as boolean,
         listingCount: snapData?.listingCount ?? 0,
       }
     })
@@ -241,15 +268,12 @@ export async function buildPreview(snapshotIds: string[]) {
     const hasSuspicious = mutations.some(v => v.suspicious)
 
     // isProjected is shown on the public price-history chart only for major moves.
-    // Compared against the stored ANCHOR (referenceValue), not the previous value —
-    // the previous value ratchets along with bad data, so a staircase decline
-    // (e.g. 49.5k → 42.9k → 41.9k → 24.9k, each step under the old 50% cutoff)
-    // was only ever flagged once. Three zones vs anchor:
-    //   within ±20-25%          → normal fluctuation, anchor follows the price
-    //   moderate drift          → not flagged, but anchor freezes (staircase defense)
-    //   ≥1.5x jump / ≥33% drop  → flagged projected, anchor freezes
-    // A frozen anchor un-freezes when price returns to the normal band, or when
-    // the new level proves stable (see acceptance pass below).
+    // Compared against the ANCHOR (30-day clean-apply average), not the previous
+    // value — the previous value ratchets along with bad data, so a staircase
+    // decline (e.g. 49.5k → 42.9k → 41.9k → 24.9k, each step under the old 50%
+    // cutoff) was only ever flagged once. The average excludes flagged applies,
+    // so suspect values can't drag it; genuine repricings un-flag via the
+    // acceptance pass below and then converge the average on their own.
     for (const m of mutations) {
       if (!m.hasNewData || !m.finalValue) continue
       const anchor = m.anchorValue
@@ -260,13 +284,9 @@ export async function buildPreview(snapshotIds: string[]) {
       if (ratio >= PROJECT_JUMP_RATIO) {
         m.isProjected = true
         m.projectedReason = `${ratio.toFixed(1)}x jump from R$${anchor.toLocaleString()}`
-        m.freezeAnchor = true
       } else if (ratio <= PROJECT_DROP_RATIO) {
         m.isProjected = true
         m.projectedReason = `${(1 / ratio).toFixed(1)}x drop from R$${anchor.toLocaleString()}`
-        m.freezeAnchor = true
-      } else if (ratio > ANCHOR_FOLLOW_HI || ratio < ANCHOR_FOLLOW_LO) {
-        m.freezeAnchor = true
       }
     }
 
@@ -280,14 +300,14 @@ export async function buildPreview(snapshotIds: string[]) {
     })
   }
 
-  // Acceptance pass: for every frozen-anchor pair, check whether the deviated
-  // level has actually held across recent applied snapshots. If it has, treat it
-  // as a genuine market move — clear the flag and let the anchor adopt the new
-  // value. Batched into one query across all candidates.
+  // Acceptance pass: for every flagged pair, check whether the deviated level
+  // has actually held across recent applied snapshots. If it has, treat it as a
+  // genuine market move and clear the flag — the cleared applies then feed the
+  // 30-day average, which converges on the new level. Batched into one query.
   const frozen: Array<{ brainrotId: string; mutation: (typeof brainrots)[number]['mutations'][number] }> = []
   for (const b of brainrots) {
     for (const m of b.mutations) {
-      if (m.freezeAnchor && m.finalValue) frozen.push({ brainrotId: b.brainrotId, mutation: m })
+      if (m.isProjected && m.finalValue) frozen.push({ brainrotId: b.brainrotId, mutation: m })
     }
   }
   if (frozen.length > 0) {
@@ -324,7 +344,6 @@ export async function buildPreview(snapshotIds: string[]) {
       if (inBand >= STABLE_ACCEPT_WINDOW - STABLE_ACCEPT_OUTLIERS) {
         m.isProjected = false
         m.projectedReason = null
-        m.freezeAnchor = false
       }
     }
   }
@@ -396,8 +415,7 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
         // Admin overrides clear the projected flag — manual values are trusted.
         isProjected: brainrotOverrides?.[v.mutationId] !== undefined ? false : v.isProjected,
         projectedReason: brainrotOverrides?.[v.mutationId] !== undefined ? null : v.projectedReason,
-        // Overrides also reset the anchor to the trusted manual value.
-        freezeAnchor: brainrotOverrides?.[v.mutationId] !== undefined ? false : v.freezeAnchor,
+        anchorValue: v.anchorValue,
       }))
 
     const interpolated = values.filter(v => v.interpolatedValue !== null && v.interpolatedValue !== v.rawValue)
@@ -416,7 +434,7 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
         robuxValue: v.robuxValue,
         isProjected: v.isProjected,
         projectedReason: v.projectedReason,
-        freezeAnchor: v.freezeAnchor,
+        anchorValue: v.anchorValue,
       })),
     }
   }).filter(b => b.values.length > 0)
@@ -427,7 +445,7 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
   }
 
   // Flatten all upserts
-  const allUpserts: { brainrotId: string; mutationId: string; robuxValue: number; isProjected: boolean; projectedReason: string | null; freezeAnchor: boolean }[] = []
+  const allUpserts: { brainrotId: string; mutationId: string; robuxValue: number; isProjected: boolean; projectedReason: string | null; anchorValue: number | null }[] = []
   for (const b of finalValues) {
     for (const v of b.values) {
       allUpserts.push({
@@ -436,16 +454,16 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
         robuxValue: v.robuxValue,
         isProjected: v.isProjected,
         projectedReason: v.projectedReason,
-        freezeAnchor: v.freezeAnchor,
+        anchorValue: v.anchorValue,
       })
     }
   }
 
-  // Pre-load rarity per brainrot + current referenceValue/robuxValue per (brainrot, mutation)
-  // so the upsert can compute volatile flag + populate previousValue/referenceValue.
+  // Pre-load rarity per brainrot + current robuxValue per (brainrot, mutation)
+  // so the upsert can compute the volatile flag + populate previousValue.
   const brainrotIdsForApply = [...new Set(allUpserts.map(u => u.brainrotId))]
   const rarityByBrainrotId = new Map<string, string | null>()
-  const currentValueByKey = new Map<string, { robuxValue: number; referenceValue: number | null }>()
+  const currentValueByKey = new Map<string, { robuxValue: number }>()
   if (brainrotIdsForApply.length > 0) {
     const rarityPlaceholders = brainrotIdsForApply.map((_, i) => `$${i + 1}`).join(', ')
     const rarityRows = await query<{ id: string; rarity: string | null }>(
@@ -454,14 +472,14 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
     )
     for (const r of rarityRows) rarityByBrainrotId.set(r.id, r.rarity)
 
-    const currentRows = await query<{ brainrotId: string; mutationId: string; robuxValue: number; referenceValue: number | null }>(
-      `SELECT "brainrotId", "mutationId", "robuxValue", "referenceValue"
+    const currentRows = await query<{ brainrotId: string; mutationId: string; robuxValue: number }>(
+      `SELECT "brainrotId", "mutationId", "robuxValue"
        FROM "BrainrotMutationValue"
        WHERE "brainrotId" IN (${rarityPlaceholders})`,
       brainrotIdsForApply
     )
     for (const c of currentRows) {
-      currentValueByKey.set(`${c.brainrotId}:${c.mutationId}`, { robuxValue: c.robuxValue, referenceValue: c.referenceValue })
+      currentValueByKey.set(`${c.brainrotId}:${c.mutationId}`, { robuxValue: c.robuxValue })
     }
   }
 
@@ -470,16 +488,13 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
   const rows = allUpserts.map(u => {
     const rarity = rarityByBrainrotId.get(u.brainrotId) ?? null
     const existing = currentValueByKey.get(`${u.brainrotId}:${u.mutationId}`)
-    const anchor = existing?.referenceValue ?? existing?.robuxValue ?? null
+    const anchor = u.anchorValue ?? existing?.robuxValue ?? null
     const volatile = isVolatileJump({ newValue: u.robuxValue, referenceValue: anchor, rarity })
     const previousValue = existing?.robuxValue ?? null
     if (volatile) volatileCount++
-    // Frozen anchor: keep the pre-deviation reference so projected detection
-    // stays measured against the last trusted level instead of ratcheting.
-    const newReference = u.freezeAnchor ? (anchor ?? u.robuxValue) : u.robuxValue
     return [
       createId(), u.brainrotId, u.mutationId, u.robuxValue,
-      newReference, previousValue, volatile, nowIso, nowIso,
+      previousValue, volatile, nowIso, nowIso,
     ]
   })
 
@@ -488,12 +503,11 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
   if (rows.length > 0) {
     await bulkInsert({
       table: 'BrainrotMutationValue',
-      columns: ['id', 'brainrotId', 'mutationId', 'robuxValue', 'referenceValue', 'previousValue', 'volatile', 'createdAt', 'updatedAt'],
+      columns: ['id', 'brainrotId', 'mutationId', 'robuxValue', 'previousValue', 'volatile', 'createdAt', 'updatedAt'],
       rows,
       chunk: 500,
       onConflict: `("brainrotId","mutationId") DO UPDATE SET
         "robuxValue"     = EXCLUDED."robuxValue",
-        "referenceValue" = EXCLUDED."referenceValue",
         "previousValue"  = EXCLUDED."previousValue",
         "volatile"       = EXCLUDED."volatile",
         "updatedAt"      = EXCLUDED."updatedAt"`,
