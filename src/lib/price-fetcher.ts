@@ -306,10 +306,25 @@ function getOfferMutationSlug(offer: EldoradoOffer): string {
   return value.toLowerCase().replace(/\s+/g, '-')
 }
 
+// Sellers often name the mutation ONLY in the listing title without setting
+// Eldorado's Mutations attribute — the attribute reads "None" and the listing
+// lands in the Default ladder at a mutated price. Observed on Rang Ring Bus:
+// "$10 Phantom" / "$12.90 Crystal" title-listings entered the Default ladder,
+// dragged the median up to $10, and the median×0.2 cutoff then deleted the
+// REAL $0.50-$1.99 market as "fraud". A mutation word is only disqualifying if
+// it isn't part of the brainrot's own name.
+const MUTATION_TITLE_WORDS = ['gold', 'diamond', 'bloodrot', 'bloodroot', 'candy', 'lava', 'galaxy', 'yin\\s*yang', 'radioactive', 'cursed', 'divine', 'rainbow', 'cyber', 'phantom', 'crystal']
+const MUTATION_TITLE_PATTERNS = MUTATION_TITLE_WORDS.map(w => ({ word: w.replace('\\s*', ' '), re: new RegExp(`\\b${w}\\b`, 'i') }))
+
+function titleClaimsMutation(title: string, brainrotName: string): boolean {
+  const name = brainrotName.toLowerCase()
+  return MUTATION_TITLE_PATTERNS.some(p => !name.includes(p.word) && p.re.test(title))
+}
+
 // Re-used by both te_v2 (Mode A) and searchQuery (Mode B) paths. Centralised here so
 // fraud + title + seller + mutation rules are applied identically regardless of
 // fetch mode.
-function filterTrustedOffers(offers: EldoradoOffer[], brainrotName: string, mutationSlug: string): EldoradoOffer[] {
+export function filterTrustedOffers(offers: EldoradoOffer[], brainrotName: string, mutationSlug: string): EldoradoOffer[] {
   return offers.filter(o =>
     o.userOrderInfo &&
     o.userOrderInfo.feedbackScore >= 85 &&
@@ -323,7 +338,8 @@ function filterTrustedOffers(offers: EldoradoOffer[], brainrotName: string, muta
     o.offer.quantity === 1 &&
     titleMatchesBrainrot(o.offer.offerTitle, brainrotName) &&
     !isFraudTitle(o.offer.offerTitle) &&
-    getOfferMutationSlug(o) === mutationSlug
+    getOfferMutationSlug(o) === mutationSlug &&
+    (mutationSlug !== 'none' || !titleClaimsMutation(o.offer.offerTitle, brainrotName))
   )
 }
 
