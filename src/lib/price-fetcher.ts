@@ -203,23 +203,39 @@ function mutationToSlug(name: string): string {
 // over-pruned the rarest brainrots: their trusted ladders are naturally sparse
 // with wide percentage gaps, and Rule E walked past REAL floors (Headless
 // Horseman's $3,000 listing from an rc=1259 shop was dropped for lacking a
-// companion within 1.25×, overshooting the floor to $8,800). Hence the current
-// bar: only a VERY established seller (rc >= 1000, fb >= 99%) can hold a lone
-// floor — an order of magnitude beyond observed rating-farms. Everyone else
+// companion within 1.25×, overshooting the floor to $8,800). The current
+// lone-floor rule is the two-lock RULE_E_LONE_* check below; everyone else
 // still needs a walk of similar prices above them.
 const RULE_E_COMPANION_RATIO = 1.25
 const RULE_E_FP_EPSILON = 1.01
 const RULE_E_MIN_PRICES = 3
+// Used by the median-cutoff exemption in pickFloorPrice.
 const RULE_E_TRUST_OVERRIDE_RC = 1000
 const RULE_E_TRUST_OVERRIDE_FB = 99
+// Lone-floor rule ("S6", backtested 12/12 across sparse/flooded/bait ladders):
+// a lowest listing with no companion may stand only when BOTH hold —
+//   1. seller rc >= 300 at fb >= 99% (3x beyond observed rating-farms, and each
+//      rating costs a real completed sale), AND
+//   2. the price is >= 0.6x the item's 30-day clean-apply average (so even a
+//      farmed account clearing bar 1 can only post near-market "bait", which is
+//      barely bait). Items with no anchor history skip check 2 — the anchor is
+//      a veto, never a predictor, so a missing/immature prior blocks nothing.
+// When the anchor is poisoned-high this degrades to rep-only — i.e. to the
+// previous behavior, never worse.
+const RULE_E_LONE_RC = 300
+const RULE_E_LONE_FB = 99
+const RULE_E_LONE_ANCHOR_RATIO = 0.6
 
 export interface PriceWithSeller { price: number; rc: number; fb: number; sellerId: string }
 
-function dropUnsupportedLowestPrices(sortedAsc: PriceWithSeller[]): PriceWithSeller[] {
+function dropUnsupportedLowestPrices(sortedAsc: PriceWithSeller[], anchorUsd: number | null): PriceWithSeller[] {
   if (sortedAsc.length < RULE_E_MIN_PRICES) return sortedAsc
   let arr = sortedAsc
   while (arr.length >= 2 && arr[1].price > arr[0].price * RULE_E_COMPANION_RATIO * RULE_E_FP_EPSILON) {
-    if (arr[0].rc >= RULE_E_TRUST_OVERRIDE_RC && arr[0].fb >= RULE_E_TRUST_OVERRIDE_FB) break
+    if (
+      arr[0].rc >= RULE_E_LONE_RC && arr[0].fb >= RULE_E_LONE_FB &&
+      (anchorUsd === null || arr[0].price >= RULE_E_LONE_ANCHOR_RATIO * anchorUsd)
+    ) break
     arr = arr.slice(1)
     if (arr.length < RULE_E_MIN_PRICES) break
   }
@@ -250,7 +266,7 @@ function dedupBySeller(trusted: PriceWithSeller[]): PriceWithSeller[] {
 // `candidatesAsc` is the post-filter sorted price ladder, returned so the
 // monotonic-constraint pass at the end of the run can walk past inversions
 // (e.g. Diamond < Gold) without re-fetching from Eldorado.
-export function pickFloorPrice(trusted: PriceWithSeller[]): { price: number | null; count: number; candidatesAsc: number[] } {
+export function pickFloorPrice(trusted: PriceWithSeller[], anchorUsd: number | null = null): { price: number | null; count: number; candidatesAsc: number[] } {
   if (trusted.length === 0) return { price: null, count: 0, candidatesAsc: [] }
   const deduped = dedupBySeller(trusted)
   const sorted = [...deduped].sort((a, b) => a.price - b.price)
@@ -265,7 +281,7 @@ export function pickFloorPrice(trusted: PriceWithSeller[]): { price: number | nu
   const afterMedian = sorted.length >= 3
     ? sorted.filter(s => s.price >= median * 0.2 || (s.rc >= RULE_E_TRUST_OVERRIDE_RC && s.fb >= RULE_E_TRUST_OVERRIDE_FB))
     : sorted
-  const afterRuleE = dropUnsupportedLowestPrices(afterMedian)
+  const afterRuleE = dropUnsupportedLowestPrices(afterMedian, anchorUsd)
   if (afterRuleE.length === 0) return { price: null, count: 0, candidatesAsc: [] }
   return { price: afterRuleE[0].price, count: afterRuleE.length, candidatesAsc: afterRuleE.map(s => s.price) }
 }
@@ -723,6 +739,30 @@ export async function fetchAllBrainrotPrices(
   // cancelled later — the bulk-insert step in the trigger can save whatever
   // got pushed before the throw.
   const results: PriceResult[] = accumulator ?? []
+
+  // 30-day clean-apply average per (brainrot, mutation), in USD — the anchor
+  // for rule E's lone-floor check. Flagged applies are excluded so bait can't
+  // feed its own plausibility bound. One catalog-wide query, loaded up front.
+  const anchorUsdByKey = new Map<string, number>()
+  try {
+    const anchorRows = await query<{ brainrotId: string; mutationId: string; avgValue: number }>(
+      `SELECT "brainrotId", "mutationId", AVG("appliedRobuxValue")::float8 AS "avgValue"
+       FROM "PriceSnapshot"
+       WHERE "appliedToValues" = true AND "isProjected" = false
+         AND "appliedRobuxValue" IS NOT NULL
+         AND "createdAt" >= NOW() - INTERVAL '30 days'
+       GROUP BY "brainrotId", "mutationId"`
+    )
+    for (const a of anchorRows) {
+      if (a.avgValue > 0) anchorUsdByKey.set(`${a.brainrotId}:${a.mutationId}`, a.avgValue / 100)
+    }
+    console.log(`[price-fetcher] loaded ${anchorUsdByKey.size} lone-floor anchors`)
+  } catch (err) {
+    // Anchor is a veto, not a requirement — without it rule E falls back to
+    // rep-only, which is still safe.
+    console.error('[price-fetcher] anchor load failed, continuing without:', err)
+  }
+
   // Trusted-price ladder per (brainrotId, mutKey) for Default/Gold/Diamond. Used by
   // the post-run monotonic-constraint sweep to walk Gold/Diamond up past their
   // predecessor's floor instead of re-fetching.
@@ -757,7 +797,7 @@ export async function fetchAllBrainrotPrices(
       if (!p1Data) continue
 
       const trusted = filterTrustedOffers(p1Data.offers, brainrot.eldoradoName, mutationToSlug(mutation.name))
-      const { price, count, candidatesAsc } = pickFloorPrice(trusted.map(o => ({ price: o.offer.pricePerUnitInUSD.amount, rc: o.userOrderInfo.ratingCount, fb: o.userOrderInfo.feedbackScore, sellerId: o.offer.userId })))
+      const { price, count, candidatesAsc } = pickFloorPrice(trusted.map(o => ({ price: o.offer.pricePerUnitInUSD.amount, rc: o.userOrderInfo.ratingCount, fb: o.userOrderInfo.feedbackScore, sellerId: o.offer.userId })), anchorUsdByKey.get(`${brainrot.id}:${mutation.id}`) ?? null)
 
       const minListings = getMinListings(brainrot.rarity, mutation.name)
       if (price !== null) totalWithPrices++; else totalNullPrices++
@@ -793,7 +833,7 @@ export async function fetchAllBrainrotPrices(
               const minListings = getMinListings(brainrot.rarity, mutation.name)
               const offers = await fetchOffersForMutation(brainrot.eldoradoName, slug, brainrot.rarity, controller.signal, minListings)
               const trusted = filterTrustedOffers(offers, brainrot.eldoradoName, slug)
-              const { price, count, candidatesAsc } = pickFloorPrice(trusted.map(o => ({ price: o.offer.pricePerUnitInUSD.amount, rc: o.userOrderInfo.ratingCount, fb: o.userOrderInfo.feedbackScore, sellerId: o.offer.userId })))
+              const { price, count, candidatesAsc } = pickFloorPrice(trusted.map(o => ({ price: o.offer.pricePerUnitInUSD.amount, rc: o.userOrderInfo.ratingCount, fb: o.userOrderInfo.feedbackScore, sellerId: o.offer.userId })), anchorUsdByKey.get(`${brainrot.id}:${mutation.id}`) ?? null)
               const mutKeyLower = mutation.name.toLowerCase()
               if (CONSTRAINT_MUTATIONS.has(mutKeyLower)) {
                 candidatesByCombo.set(`${brainrot.id}:${mutKeyLower}`, candidatesAsc)
@@ -884,7 +924,7 @@ export async function fetchAllBrainrotPrices(
               try {
                 const offers = await fetchOffersViaSearchAllPages(brainrot.name, slug, brainrot.rarity, controller.signal)
                 const trusted = filterTrustedOffers(offers, brainrot.name, slug)
-                const { price, count, candidatesAsc } = pickFloorPrice(trusted.map(o => ({ price: o.offer.pricePerUnitInUSD.amount, rc: o.userOrderInfo.ratingCount, fb: o.userOrderInfo.feedbackScore, sellerId: o.offer.userId })))
+                const { price, count, candidatesAsc } = pickFloorPrice(trusted.map(o => ({ price: o.offer.pricePerUnitInUSD.amount, rc: o.userOrderInfo.ratingCount, fb: o.userOrderInfo.feedbackScore, sellerId: o.offer.userId })), anchorUsdByKey.get(`${brainrot.id}:${mutation.id}`) ?? null)
                 const minListings = getMinListings(brainrot.rarity, mutation.name)
                 const mutKeyLower = mutation.name.toLowerCase()
                 if (CONSTRAINT_MUTATIONS.has(mutKeyLower)) {
