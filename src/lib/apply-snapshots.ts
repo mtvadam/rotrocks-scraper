@@ -16,6 +16,10 @@ const ANCHOR_FOLLOW_LO = 0.8
 // thresholds alone drown the flag in noise. The anchor machinery only engages
 // when the move is also at least this many robux; smaller moves always follow.
 const PROJECT_MIN_DELTA_ROBUX = 1000
+// ...unless the move is extreme: a cheap floor can never shift R$1,000, yet a
+// 3x+ swing is projected pricing, not a coarse tick (observed: Los Cucarachas
+// R$25 → R$95 wore no flag). Extreme ratios bypass the delta gate.
+const PROJECT_EXTREME_RATIO = 3
 // Acceptance: a deviated level becomes the new anchor (and un-flags) once it has
 // held for STABLE_ACCEPT_WINDOW recent applied snapshots with at most
 // STABLE_ACCEPT_OUTLIERS wobbles outside the follow band — i.e. a genuine market
@@ -250,8 +254,9 @@ export async function buildPreview(snapshotIds: string[]) {
       if (!m.hasNewData || !m.finalValue) continue
       const anchor = m.anchorValue
       if (!anchor || anchor <= 0) continue
-      if (Math.abs(m.finalValue - anchor) < PROJECT_MIN_DELTA_ROBUX) continue
       const ratio = m.finalValue / anchor
+      const extreme = ratio >= PROJECT_EXTREME_RATIO || ratio <= 1 / PROJECT_EXTREME_RATIO
+      if (!extreme && Math.abs(m.finalValue - anchor) < PROJECT_MIN_DELTA_ROBUX) continue
       if (ratio >= PROJECT_JUMP_RATIO) {
         m.isProjected = true
         m.projectedReason = `${ratio.toFixed(1)}x jump from R$${anchor.toLocaleString()}`

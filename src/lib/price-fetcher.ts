@@ -195,14 +195,16 @@ function mutationToSlug(name: string): string {
 // big gap up to the rest. Disabled for markets with <3 listings (too little signal).
 // Repeats until the current lowest has a companion, which handles cascading outliers.
 //
-// Reputation override: skip the drop when the lowest-priced seller has decent
-// established reputation (rc >= 50 + fb >= 99%). Rule E was designed to catch
-// new-account undercutters; a 50+ rated seller at 99%+ is past that bar.
+// NO reputation override, deliberately. There used to be one (rc >= 50 + fb >= 99%
+// skipped the drop) on the theory that only new-account undercutters post fake
+// floors — then scam accounts with farmed ratings (fb=100, rc=100) started
+// posting bait listings and sailed straight through it (observed: an $8
+// "Rebirth Cannelloni Dragoni" listing set Dragon Cannelloni's floor while the
+// real market walked at $15.29+). Reputation can be bought; a companion price
+// can't. The lowest price must ALWAYS have a walk of similar prices above it.
 const RULE_E_COMPANION_RATIO = 1.25
 const RULE_E_FP_EPSILON = 1.01
 const RULE_E_MIN_PRICES = 3
-const RULE_E_TRUST_OVERRIDE_RC = 50
-const RULE_E_TRUST_OVERRIDE_FB = 99
 
 export interface PriceWithSeller { price: number; rc: number; fb: number; sellerId: string }
 
@@ -210,10 +212,6 @@ function dropUnsupportedLowestPrices(sortedAsc: PriceWithSeller[]): PriceWithSel
   if (sortedAsc.length < RULE_E_MIN_PRICES) return sortedAsc
   let arr = sortedAsc
   while (arr.length >= 2 && arr[1].price > arr[0].price * RULE_E_COMPANION_RATIO * RULE_E_FP_EPSILON) {
-    // Trust override: don't drop the lowest if its seller has very high reputation.
-    // Rule E exists to catch new-account undercutters; a 6754-rated 99.8% seller
-    // pricing a vanilla listing below trait-bundle listings is a real market floor.
-    if (arr[0].rc >= RULE_E_TRUST_OVERRIDE_RC && arr[0].fb >= RULE_E_TRUST_OVERRIDE_FB) break
     arr = arr.slice(1)
     if (arr.length < RULE_E_MIN_PRICES) break
   }
