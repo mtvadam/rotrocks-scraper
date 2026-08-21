@@ -306,6 +306,13 @@ function filterTrustedOffers(offers: EldoradoOffer[], brainrotName: string, muta
     o.userOrderInfo &&
     o.userOrderInfo.feedbackScore >= 85 &&
     o.userOrderInfo.ratingCount >= 10 &&
+    // Real listings of scraped rarities (Secret/OG) are single items. Bulk
+    // quantities are duper floods — observed: 3 accounts posting 141 qty=10
+    // Strawberry Elephant listings at ~1/6th market, whose own dense price
+    // ladder satisfied rule E's companion check and buried the real market
+    // beyond the page window. Better to find no price (keeps previous value)
+    // than to price off a flood.
+    o.offer.quantity === 1 &&
     titleMatchesBrainrot(o.offer.offerTitle, brainrotName) &&
     !isFraudTitle(o.offer.offerTitle) &&
     getOfferMutationSlug(o) === mutationSlug
