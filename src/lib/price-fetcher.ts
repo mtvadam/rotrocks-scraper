@@ -176,7 +176,7 @@ const FRAUD_TITLE_PATTERNS = [
   /\brecipe\b/i,
   /\bmaterial(s)?\b/i,
   /\bingredient(s)?\b/i,
-  /\bbundle\b/i,
+  /\bbundles?\b/i,
   /\bfull\s*set\b/i,
 ]
 
@@ -255,7 +255,16 @@ export function pickFloorPrice(trusted: PriceWithSeller[]): { price: number | nu
   const deduped = dedupBySeller(trusted)
   const sorted = [...deduped].sort((a, b) => a.price - b.price)
   const median = sorted[Math.floor(sorted.length / 2)].price
-  const afterMedian = sorted.length >= 3 ? sorted.filter(s => s.price >= median * 0.2) : sorted
+  // Strict-rep sellers are exempt from the median cutoff: on near-worthless
+  // brainrots the ask ladder is padded with delusional "rare unobtainable"
+  // listings that drag the median up until the cutoff sits ABOVE the real
+  // floor (observed: Vulturino Skeletono's two $0.50 listings from rc=6167 and
+  // rc=2314 shops were dropped as "fraud" by a ~$0.80 cutoff, floor picked
+  // $0.99). Farmed ~rc=100 accounts posting paired ultra-low baits still die
+  // here — the same order-of-magnitude bar as rule E's override.
+  const afterMedian = sorted.length >= 3
+    ? sorted.filter(s => s.price >= median * 0.2 || (s.rc >= RULE_E_TRUST_OVERRIDE_RC && s.fb >= RULE_E_TRUST_OVERRIDE_FB))
+    : sorted
   const afterRuleE = dropUnsupportedLowestPrices(afterMedian)
   if (afterRuleE.length === 0) return { price: null, count: 0, candidatesAsc: [] }
   return { price: afterRuleE[0].price, count: afterRuleE.length, candidatesAsc: afterRuleE.map(s => s.price) }
