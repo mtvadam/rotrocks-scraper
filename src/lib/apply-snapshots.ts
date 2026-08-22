@@ -36,6 +36,10 @@ const PROJECT_EXTREME_RATIO = 3
 const STABLE_ACCEPT_WINDOW = 12
 const STABLE_ACCEPT_OUTLIERS = 2
 const STABLE_ACCEPT_LOOKBACK_DAYS = 14
+// Mutations may trade slightly below their brainrot's Default (some markets
+// genuinely price Gold under base), but never drastically below — the apply
+// step clamps mutation values up to this fraction of Default.
+const MUTATION_FLOOR_RATIO = 0.8
 
 /**
  * Build a preview of how a batch of PriceSnapshot rows would translate into
@@ -515,25 +519,27 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
   }
   console.log(`[apply] bulk upsert done in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 
-  // Invariant: no mutation is ever worth less than its brainrot's Default.
-  // Clamp every mutation row of the touched brainrots up to the (possibly just
-  // updated) Default — this also heals stale fossil rows whose market died
+  // Invariant: a mutation can trade a BIT below its brainrot's Default (some
+  // markets genuinely price Gold under Default), but never drastically below —
+  // that's always a fossil or bad data. Clamp every mutation row of the
+  // touched brainrots up to MUTATION_FLOOR_RATIO x the (possibly just updated)
+  // Default. This also heals stale fossil rows whose mutation market died
   // long ago (e.g. La Supreme Combinasion Yin Yang stuck at a $9.99 lone-
   // listing apply from May while Default sat at $41.99) whenever their
   // brainrot gets any update at all.
   if (brainrotIdsForApply.length > 0) {
     const clamped = await execute(
       `UPDATE "BrainrotMutationValue" bv
-       SET "robuxValue" = d."robuxValue", "updatedAt" = NOW()
+       SET "robuxValue" = ROUND(d."robuxValue" * ${MUTATION_FLOOR_RATIO}), "updatedAt" = NOW()
        FROM "BrainrotMutationValue" d, "Mutation" dm
        WHERE dm."id" = d."mutationId" AND dm."name" = 'Default'
          AND d."brainrotId" = bv."brainrotId"
          AND bv."mutationId" <> d."mutationId"
          AND bv."brainrotId" = ANY($1::text[])
-         AND bv."robuxValue" < d."robuxValue"`,
+         AND bv."robuxValue" < ROUND(d."robuxValue" * ${MUTATION_FLOOR_RATIO})`,
       [brainrotIdsForApply]
     )
-    if (clamped > 0) console.log(`[apply] clamped ${clamped} mutation values up to their Default floor`)
+    if (clamped > 0) console.log(`[apply] clamped ${clamped} mutation values up to ${MUTATION_FLOOR_RATIO}x their Default`)
   }
   if (volatileCount > 0) console.log(`[apply] flagged ${volatileCount} volatile value changes`)
 
