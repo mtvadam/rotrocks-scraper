@@ -514,6 +514,27 @@ export async function applySnapshots(opts: ApplySnapshotsOptions): Promise<Apply
     })
   }
   console.log(`[apply] bulk upsert done in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+
+  // Invariant: no mutation is ever worth less than its brainrot's Default.
+  // Clamp every mutation row of the touched brainrots up to the (possibly just
+  // updated) Default — this also heals stale fossil rows whose market died
+  // long ago (e.g. La Supreme Combinasion Yin Yang stuck at a $9.99 lone-
+  // listing apply from May while Default sat at $41.99) whenever their
+  // brainrot gets any update at all.
+  if (brainrotIdsForApply.length > 0) {
+    const clamped = await execute(
+      `UPDATE "BrainrotMutationValue" bv
+       SET "robuxValue" = d."robuxValue", "updatedAt" = NOW()
+       FROM "BrainrotMutationValue" d, "Mutation" dm
+       WHERE dm."id" = d."mutationId" AND dm."name" = 'Default'
+         AND d."brainrotId" = bv."brainrotId"
+         AND bv."mutationId" <> d."mutationId"
+         AND bv."brainrotId" = ANY($1::text[])
+         AND bv."robuxValue" < d."robuxValue"`,
+      [brainrotIdsForApply]
+    )
+    if (clamped > 0) console.log(`[apply] clamped ${clamped} mutation values up to their Default floor`)
+  }
   if (volatileCount > 0) console.log(`[apply] flagged ${volatileCount} volatile value changes`)
 
   // Mark snapshots as applied AND record the interpolated value per (brainrot, mutation)
