@@ -223,6 +223,13 @@ const RULE_E_MIN_PRICES = 3
 const RULE_E_LONE_RC = 300
 const RULE_E_LONE_FB = 99
 
+// A mutation can trade a bit below its brainrot's Default (some markets
+// genuinely price Gold under base), but never drastically below — a scraped
+// mutation floor under this fraction of Default is a mislabeled/bait/fossil
+// listing. Such results are IGNORED (nulled), so the combo takes the normal
+// no-data path and keeps its previous value; no synthetic value is written.
+const MUTATION_FLOOR_RATIO = 0.8
+
 export interface PriceWithSeller { price: number; rc: number; fb: number; sellerId: string }
 
 function dropUnsupportedLowestPrices(sortedAsc: PriceWithSeller[]): PriceWithSeller[] {
@@ -1015,6 +1022,44 @@ export async function fetchAllBrainrotPrices(
   if (counters.adjusted || counters.nullified) {
     console.log(`[price-fetcher] monotonic constraint applied: adjusted=${counters.adjusted}, nullified=${counters.nullified}`)
   }
+
+  // Mutation-floor sweep: ignore any non-Default result priced under
+  // MUTATION_FLOOR_RATIO x the brainrot's Default (this run's pick, falling
+  // back to the stored value). Nulling the price makes the combo take the
+  // normal no-data path — previous value kept, no snapshot applied.
+  const storedDefaultUsd = new Map<string, number>()
+  {
+    const idsArr = [...brainrotIds]
+    if (idsArr.length > 0) {
+      try {
+        const rows = await query<{ brainrotId: string; robuxValue: number }>(
+          `SELECT bv."brainrotId", bv."robuxValue"
+           FROM "BrainrotMutationValue" bv
+           JOIN "Mutation" m ON m."id" = bv."mutationId"
+           WHERE m."name" = 'Default' AND bv."brainrotId" = ANY($1::text[])`,
+          [idsArr]
+        )
+        for (const r of rows) if (r.robuxValue > 0) storedDefaultUsd.set(r.brainrotId, r.robuxValue / 100)
+      } catch (err) {
+        console.error('[price-fetcher] mutation-floor: stored-Default load failed, using run Defaults only:', err)
+      }
+    }
+  }
+  let floorIgnored = 0
+  for (const r of results) {
+    if (r.mutation === 'Default' || r.usdPrice === null) continue
+    const defUsd = findResult(r.brainrotId, 'Default')?.usdPrice ?? storedDefaultUsd.get(r.brainrotId) ?? null
+    if (defUsd === null) continue
+    if (r.usdPrice < defUsd * MUTATION_FLOOR_RATIO) {
+      console.log(`[price-fetcher] mutation-floor: ${r.brainrotName}/${r.mutation} $${r.usdPrice} ignored (< ${MUTATION_FLOOR_RATIO}x Default $${defUsd}) — keeping previous value`)
+      r.usdPrice = null
+      r.robuxPrice = null
+      r.listingCount = 0
+      r.isOutlier = true
+      floorIgnored++
+    }
+  }
+  if (floorIgnored) console.log(`[price-fetcher] mutation-floor: ignored ${floorIgnored} under-priced mutation results`)
 
   console.log(`[price-fetcher] FINISHED: total=${results.length}, withPrices=${totalWithPrices}, nullPrices=${totalNullPrices}, errors=${totalErrors}`)
   return results
