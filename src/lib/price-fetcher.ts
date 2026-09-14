@@ -229,6 +229,10 @@ const RULE_E_LONE_FB = 99
 // listing. Such results are IGNORED (nulled), so the combo takes the normal
 // no-data path and keeps its previous value; no synthetic value is written.
 const MUTATION_FLOOR_RATIO = 0.8
+// Gold and Diamond are derived from Default at fixed ratios (see the post-run
+// derivation sweep), never scraped.
+const GOLD_DERIVED_RATIO = 1.1
+const DIAMOND_DERIVED_RATIO = 1.2
 
 export interface PriceWithSeller { price: number; rc: number; fb: number; sellerId: string }
 
@@ -1060,6 +1064,37 @@ export async function fetchAllBrainrotPrices(
     }
   }
   if (floorIgnored) console.log(`[price-fetcher] mutation-floor: ignored ${floorIgnored} under-priced mutation results`)
+
+  // Gold and Diamond are DERIVED, never taken from the market: Gold = 1.1x and
+  // Diamond = 1.2x of the brainrot's Default from this run. Their scraped
+  // floors are chronically unreliable (thin ladders, mislabeled listings), and
+  // hardcoding the ratio keeps every card's ladder consistent. Overrides any
+  // scraped Gold/Diamond result; when Default found no price this run, the
+  // pair is skipped and keeps its previous value like any no-data combo.
+  for (const bid of brainrotIds) {
+    const def = findResult(bid, 'Default')
+    if (!def || def.usdPrice === null) continue
+    for (const [mutName, ratio] of [['Gold', GOLD_DERIVED_RATIO], ['Diamond', DIAMOND_DERIVED_RATIO]] as const) {
+      const usd = Math.round(def.usdPrice * ratio * 100) / 100
+      const existing = findResult(bid, mutName)
+      if (existing) {
+        existing.usdPrice = usd
+        existing.robuxPrice = Math.round(usd * 100)
+        existing.listingCount = def.listingCount
+        existing.isOutlier = def.isOutlier
+      } else {
+        const mut = mutations.find(m => m.name === mutName)
+        if (mut) {
+          results.push({
+            brainrotId: bid, brainrotName: def.brainrotName,
+            mutation: mutName, mutationId: mut.id,
+            usdPrice: usd, robuxPrice: Math.round(usd * 100),
+            listingCount: def.listingCount, isOutlier: def.isOutlier,
+          })
+        }
+      }
+    }
+  }
 
   console.log(`[price-fetcher] FINISHED: total=${results.length}, withPrices=${totalWithPrices}, nullPrices=${totalNullPrices}, errors=${totalErrors}`)
   return results
